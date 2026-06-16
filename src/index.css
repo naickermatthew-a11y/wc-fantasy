@@ -1,0 +1,96 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #0a0f0d;
+  color: #f0fdf4;
+  font-family: system-ui, sans-serif;
+}
+
+@layer utilities {
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+
+  .font-orbitron {
+    font-family: 'Orbitron', monospace;
+  }
+
+  .card-neon {
+    box-shadow: 0 0 0 1px rgba(0, 255, 135, 0.12), 0 0 16px rgba(0, 255, 135, 0.07);
+  }
+}
+
+/* ── Scanlines ─────────────────────────────────────────────────────────────── */
+
+.scanlines {
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 3px,
+    rgba(0, 0, 0, 0.18) 3px,
+    rgba(0, 0, 0, 0.18) 4px
+  );
+}
+
+/* ── Live badge glow ───────────────────────────────────────────────────────── */
+
+@keyframes live-glow {
+  0%, 100% { box-shadow: 0 0 4px rgba(0, 255, 135, 0.3); }
+  50%       { box-shadow: 0 0 14px rgba(0, 255, 135, 0.85), 0 0 28px rgba(0, 255, 135, 0.3); }
+}
+
+.live-badge-glow {
+  animation: live-glow 1.5s ease-in-out infinite;
+}
+
+/* ── Goal card flash ───────────────────────────────────────────────────────── */
+
+@keyframes goal-flash {
+  0%, 100% { box-shadow: none; }
+  25%, 75%  { box-shadow: 0 0 28px rgba(0, 255, 135, 0.85), 0 0 60px rgba(0, 255, 135, 0.4), inset 0 0 14px rgba(0, 255, 135, 0.15); }
+}
+
+.animate-goal-flash {
+  animation: goal-flash 1s ease-in-out;
+}
+
+/* ── Floating +pts ─────────────────────────────────────────────────────────── */
+
+@keyframes float-up {
+  0%   { opacity: 1; transform: translateY(0) scale(1); }
+  80%  { opacity: 0.8; }
+  100% { opacity: 0; transform: translateY(-72px) scale(1.25); }
+}
+
+.animate-float-up {
+  animation: float-up 1.4s ease-out forwards;
+}
+
+/* ── Screen edge flash ─────────────────────────────────────────────────────── */
+
+@keyframes screen-flash {
+  0%   { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.animate-screen-flash {
+  animation: screen-flash 0.55s ease-out forwards;
+}
+
+/* ── GAME OVER banner ──────────────────────────────────────────────────────── */
+
+@keyframes game-over-in {
+  0%   { opacity: 0; transform: scale(0.5) translateY(16px); letter-spacing: 0.25em; }
+  60%  { opacity: 1; transform: scale(1.06) translateY(-4px); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.animate-game-over {
+  animation: game-over-in 0.7s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
