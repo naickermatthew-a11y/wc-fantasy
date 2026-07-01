@@ -1,26 +1,42 @@
 // In dev, Vite proxies /api-football → https://v3.football.api-sports.io to avoid CORS.
-// In production, call the API directly (deploy behind a server-side proxy or serverless fn).
-const BASE_URL = import.meta.env.DEV ? '/api-football' : 'https://v3.football.api-sports.io'
+// In production, /api/* Vercel serverless functions proxy the same requests server-side
+// (see api/fixtures.js, api/lineups.js, api/events.js, api/players.js) so the API key
+// never ships in the client bundle.
+const UPSTREAM_PATH = {
+  fixtures: '/fixtures',
+  lineups: '/fixtures/lineups',
+  events: '/fixtures/events',
+  players: '/fixtures/players',
+}
+
+function endpointUrl(endpoint, query) {
+  const qs = query ? `?${query}` : ''
+  return import.meta.env.DEV
+    ? `/api-football${UPSTREAM_PATH[endpoint]}${qs}`
+    : `/api/${endpoint}${qs}`
+}
 
 // Confirmed via GET /leagues?name=World+Cup&season=2026 → id:1, current:true
 const WC_LEAGUE_ID = 1
 const WC_SEASON = 2026
 
 export function isApiFootballConfigured() {
-  return !!import.meta.env.VITE_API_FOOTBALL_KEY
+  // Dev talks to api-sports.io directly through the Vite proxy, so it needs a client-side
+  // key. In production the key lives server-side in the /api/* functions, so it's always on.
+  return import.meta.env.DEV ? !!import.meta.env.VITE_API_FOOTBALL_KEY : true
 }
 
-async function apiFetch(path) {
-  const key = import.meta.env.VITE_API_FOOTBALL_KEY
-  const url = `${BASE_URL}${path}`
+async function apiFetch(endpoint, query) {
+  const url = endpointUrl(endpoint, query)
+  const key = import.meta.env.DEV ? import.meta.env.VITE_API_FOOTBALL_KEY : undefined
   console.log('[API-Football] GET', url, '| key present:', !!key, '| key prefix:', key?.slice(0, 6))
 
-  const res = await fetch(url, {
+  const res = await fetch(url, key ? {
     headers: {
       'x-apisports-key': key,
       'x-apisports-host': 'v3.football.api-sports.io',
     },
-  })
+  } : undefined)
   console.log('[API-Football] status:', res.status, res.statusText)
 
   if (!res.ok) throw new Error(`API-Football ${res.status}`)
@@ -160,8 +176,8 @@ export async function fetchWCFixtures() {
   console.log('[API-Football] fetchWCFixtures — AEST window:', from, '→', to)
 
   const [liveRaw, rangeRaw] = await Promise.all([
-    apiFetch(`/fixtures?league=${WC_LEAGUE_ID}&season=${WC_SEASON}&live=all`),
-    apiFetch(`/fixtures?league=${WC_LEAGUE_ID}&season=${WC_SEASON}&from=${from}&to=${to}`),
+    apiFetch('fixtures', `league=${WC_LEAGUE_ID}&season=${WC_SEASON}&live=all`),
+    apiFetch('fixtures', `league=${WC_LEAGUE_ID}&season=${WC_SEASON}&from=${from}&to=${to}`),
   ])
 
   console.log('[API-Football] live count:', liveRaw.length, '| range count:', rangeRaw.length)
@@ -196,11 +212,11 @@ export async function fetchLineup(fixtureId) {
   console.log('[fetchLineup] ── requesting fixture:', fixtureId)
 
   // Use a raw fetch so we can log the full response body before any processing
-  const key = import.meta.env.VITE_API_FOOTBALL_KEY
-  const url = `${BASE_URL}/fixtures/lineups?fixture=${fixtureId}`
-  const res = await fetch(url, {
+  const url = endpointUrl('lineups', `fixture=${fixtureId}`)
+  const key = import.meta.env.DEV ? import.meta.env.VITE_API_FOOTBALL_KEY : undefined
+  const res = await fetch(url, key ? {
     headers: { 'x-apisports-key': key, 'x-apisports-host': 'v3.football.api-sports.io' },
-  })
+  } : undefined)
   const json = await res.json()
 
   console.log('[fetchLineup] ── HTTP status:', res.status)
@@ -238,7 +254,7 @@ export async function fetchLineup(fixtureId) {
 // Returns { elapsed, status, homeScore, awayScore } or null on failure.
 
 export async function fetchFixtureStatus(fixtureId) {
-  const data = await apiFetch(`/fixtures?id=${fixtureId}`)
+  const data = await apiFetch('fixtures', `id=${fixtureId}`)
   if (!data || data.length === 0) return null
   const f = data[0]
   const elapsed = f.fixture.status.elapsed ?? 0
@@ -258,7 +274,7 @@ export async function fetchFixtureStatus(fixtureId) {
 // ── Public: fetch raw events for a live fixture ───────────────────────────────
 
 export async function fetchFixtureEvents(fixtureId) {
-  return apiFetch(`/fixtures/events?fixture=${fixtureId}`)
+  return apiFetch('events', `fixture=${fixtureId}`)
 }
 
 // ── Public: fetch per-player stats for cumulative scoring ────────────────────
@@ -266,7 +282,7 @@ export async function fetchFixtureEvents(fixtureId) {
 // Used to detect completed-passes batches, shots blocked, and interceptions.
 
 export async function fetchPlayerStats(fixtureId) {
-  const data = await apiFetch(`/fixtures/players?fixture=${fixtureId}`)
+  const data = await apiFetch('players', `fixture=${fixtureId}`)
   const stats = {}
   for (const team of (data || [])) {
     for (const entry of (team.players || [])) {
