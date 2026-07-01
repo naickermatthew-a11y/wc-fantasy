@@ -6,6 +6,7 @@ import { fetchFixtureStatus, fetchFixtureEvents, mapApiEventsToGame, fetchPlayer
 import { getFallbackPlayers } from '../lib/playerUtils'
 import CaptainBadge from '../components/CaptainBadge'
 import FlagImg from '../components/FlagImg'
+import RoomCodePill from '../components/RoomCodePill'
 
 const POLL_MS = 60000
 
@@ -23,6 +24,7 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
   const minuteRef = useRef(localGS.minute ?? 1)
   const gameOverRef = useRef(false)
   const lastApiMinuteRef = useRef(0)
+  const processedEventKeysRef = useRef(new Set())  // deduplicate re-polled events
   const lastPlayerStatsRef = useRef({})   // cumulative player stats from previous poll
   const statsInitializedRef = useRef(false) // first successful stats poll sets baseline, not events
 
@@ -154,18 +156,20 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
         const status = await fetchFixtureStatus(effectiveMatch.id)
         console.log('[poll] fetchFixtureStatus:', status)
         if (status) {
-          minuteRef.current = status.elapsed
+          // effectiveMinute = elapsed + extra (e.g. 94 when API says 90+4')
+          const effectiveMinute = status.effectiveMinute
+          minuteRef.current = effectiveMinute
           const gs = gsRef.current
-          const updatedGS = { ...gs, minute: status.elapsed, homeScore: status.homeScore, awayScore: status.awayScore }
+          const updatedGS = { ...gs, minute: effectiveMinute, homeScore: status.homeScore, awayScore: status.awayScore }
 
-          // Expire power-up timers
-          if (gs.doubleDownActive && status.elapsed >= gs.doubleDownActive.endsAtMinute) {
+          // Expire power-up timers (use effectiveMinute so they correctly expire in stoppage)
+          if (gs.doubleDownActive && effectiveMinute >= gs.doubleDownActive.endsAtMinute) {
             updatedGS.doubleDownActive = null
-            await insertSystemEvent(code, status.elapsed, '⚡ Double Down expired.')
+            await insertSystemEvent(code, effectiveMinute, '⚡ Double Down expired.')
           }
-          if (gs.freezeActive && status.elapsed >= gs.freezeActive.endsAtMinute) {
+          if (gs.freezeActive && effectiveMinute >= gs.freezeActive.endsAtMinute) {
             updatedGS.freezeActive = null
-            await insertSystemEvent(code, status.elapsed, '🧊 Freeze expired.')
+            await insertSystemEvent(code, effectiveMinute, '🧊 Freeze expired.')
           }
 
           // End game when API reports full time
@@ -183,13 +187,23 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
           if (clockErr) console.error('[poll] rooms clock update error:', JSON.stringify(clockErr))
         }
 
-        // 2. Fetch and award real match events (goals, cards)
+        // 2. Fetch and award real match events (goals, cards, substitutions).
+        // Deduplicate at the raw-event level: filter out any API event already seen this
+        // session before mapping, then mark all unseen events as processed after the loop.
+        // This prevents the same raw event (which can fan out into goal + assist) from
+        // being double-counted regardless of whether the player is drafted.
         const rawEvents = await fetchFixtureEvents(effectiveMatch.id)
         const allDrafted = playersRef.current.flatMap(p => p.picks || [])
-        const newEvents = mapApiEventsToGame(rawEvents, allDrafted, lastApiMinuteRef.current)
-        for (const { apiName, player, eventType } of newEvents) {
-          await fireEvent(apiName, player, eventType)
+        const unseenRaw = rawEvents.filter(e => !processedEventKeysRef.current.has(rawApiEventKey(e)))
+        const newEvents = mapApiEventsToGame(unseenRaw, allDrafted, lastApiMinuteRef.current, true)
+        for (const ev of newEvents) {
+          if (ev.eventType === 'substitution') {
+            await handleApiSub(ev)
+          } else {
+            await fireEvent(ev.apiName, ev.player, ev.eventType)
+          }
         }
+        for (const e of unseenRaw) processedEventKeysRef.current.add(rawApiEventKey(e))
         if (newEvents.length > 0) {
           lastApiMinuteRef.current = Math.max(lastApiMinuteRef.current, ...newEvents.map(e => e.minute))
         }
@@ -287,6 +301,52 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
       const { error: gsErr } = await supabase.from('rooms').update({ game_state: updatedGS }).eq('code', code)
       if (gsErr) console.error('[fireEvent] rooms scores update error:', JSON.stringify(gsErr))
     }
+  }
+
+  async function handleApiSub({ player: playerOff, playerOnApiId, playerOnApiName, minute: subMinute }) {
+    if (!playerOff) return  // Only swap when a drafted player was subbed off
+
+    const pls = playersRef.current
+    const ownerRow = pls.find(p => (p.picks || []).some(fp => fp.id === playerOff.id))
+    if (!ownerRow) return
+
+    const playerOnApiLast = playerOnApiName?.trim().split(/\s+/).pop().toLowerCase()
+    const playerOn = allFantasyPlayers.find(p =>
+      p.id === `api-${playerOnApiId}` ||
+      (playerOnApiLast && playerOnApiLast.length >= 3 &&
+        p.name.trim().split(/\s+/).pop().toLowerCase() === playerOnApiLast)
+    ) || {
+      id: `sub-${playerOnApiId || Date.now()}`,
+      name: playerOnApiName || 'Substitute',
+      team: playerOff.team,
+      position: playerOff.position,
+      number: null,
+    }
+
+    const playerOnAugmented = {
+      ...playerOn,
+      subbedInAt: subMinute,
+      subbedInFor: playerOff.name,
+      replacedPlayerId: playerOff.id,
+    }
+
+    const newPicks = (ownerRow.picks || []).map(p => p.id === playerOff.id ? playerOnAugmented : p)
+
+    // Update local ref immediately so subsequent events in this poll cycle are attributed correctly
+    const updatedPlayers = pls.map(p =>
+      p.user_id === ownerRow.user_id ? { ...p, picks: newPicks } : p
+    )
+    playersRef.current = updatedPlayers
+    setPlayers(updatedPlayers)
+
+    await supabase.from('room_players').update({ picks: newPicks })
+      .eq('room_code', code).eq('user_id', ownerRow.user_id)
+
+    const ownerLabel = ownerRow.user_id === userId ? 'You' : ownerRow.display_name
+    await insertSystemEvent(
+      code, subMinute,
+      `⇄ ${subMinute}' ${playerOff.name} off → ${playerOn.name} in (${ownerLabel})`
+    )
   }
 
   // ── Power-ups (any player can activate) ────────────────────────────────
@@ -392,6 +452,7 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
 
   return (
     <div className="max-w-lg mx-auto px-4 py-4">
+      <RoomCodePill code={code} />
       {/* WebSocket status indicator */}
       {wsStatus === 'reconnecting' && (
         <div className="fixed top-3 left-0 right-0 flex justify-center z-50 pointer-events-none">
@@ -437,7 +498,9 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
           ) : (
             <>
               <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse inline-block" />
-              <span className="text-green-400 font-bold text-sm">{minute}'</span>
+              <span className="text-green-400 font-bold text-sm">
+                {minute > 90 ? `90+${minute - 90}` : minute}'
+              </span>
             </>
           )}
         </div>
@@ -467,7 +530,10 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
         <div className="space-y-1.5 mb-3">
           {myPicks.map((fp, pickIdx) => {
             const events = localGS.playerPoints?.[fp.id] || []
-            const pts = events.reduce((s, e) => s + e.points, 0)
+            const lockedEvents = fp.replacedPlayerId ? (localGS.playerPoints?.[fp.replacedPlayerId] || []) : []
+            const ownPts = events.reduce((s, e) => s + e.points, 0)
+            const lockedPts = lockedEvents.reduce((s, e) => s + e.points, 0)
+            const pts = ownPts + lockedPts
             const isDoubled = doubleDownActive?.playerId === fp.id
             const isFrozen = freezeActive?.playerId === fp.id
             const isCaptain = pickIdx === 0
@@ -497,11 +563,32 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
                     <span className="text-blue-300 text-[10px] font-bold bg-blue-900/40 px-1.5 py-0.5 rounded-full">❄️ {frRemaining} min left</span>
                   )}
                 </div>
-                {events.map((ev, i) => (
-                  <div key={i} className={`text-[10px] mt-0.5 ${ev.points >= 0 ? 'text-green-600' : 'text-red-500'}`}>
-                    {ev.minute}' {SCORING[ev.eventType]?.label} {ev.points > 0 ? '+' : ''}{ev.points}
-                  </div>
-                ))}
+                {fp.subbedInAt ? (
+                  <>
+                    <div className="text-[10px] mt-1 text-orange-400/70 font-semibold">
+                      {fp.subbedInFor}: {lockedPts > 0 ? '+' : ''}{lockedPts} (locked {fp.subbedInAt}')
+                    </div>
+                    {lockedEvents.map((ev, i) => (
+                      <div key={`locked-${i}`} className={`text-[10px] mt-0.5 opacity-50 ${ev.points >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                        {ev.minute}' {SCORING[ev.eventType]?.label} {ev.points > 0 ? '+' : ''}{ev.points}
+                      </div>
+                    ))}
+                    <div className="text-[10px] mt-1 text-green-600 font-semibold">
+                      {fp.name}: {ownPts > 0 ? '+' : ''}{ownPts} since {fp.subbedInAt}'
+                    </div>
+                    {events.map((ev, i) => (
+                      <div key={i} className={`text-[10px] mt-0.5 ${ev.points >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                        {ev.minute}' {SCORING[ev.eventType]?.label} {ev.points > 0 ? '+' : ''}{ev.points}
+                      </div>
+                    ))}
+                  </>
+                ) : (
+                  events.map((ev, i) => (
+                    <div key={i} className={`text-[10px] mt-0.5 ${ev.points >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                      {ev.minute}' {SCORING[ev.eventType]?.label} {ev.points > 0 ? '+' : ''}{ev.points}
+                    </div>
+                  ))
+                )}
               </div>
             )
           })}
@@ -546,7 +633,11 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
             <p className={`text-xs font-bold uppercase tracking-widest mb-2 ${cls.text}`}>{p.display_name}</p>
             <div className="space-y-1">
               {(p.picks || []).map(fp => {
-                const pts = (localGS.playerPoints?.[fp.id] || []).reduce((s, e) => s + e.points, 0)
+                const ownPts = (localGS.playerPoints?.[fp.id] || []).reduce((s, e) => s + e.points, 0)
+                const lockedPts = fp.replacedPlayerId
+                  ? (localGS.playerPoints?.[fp.replacedPlayerId] || []).reduce((s, e) => s + e.points, 0)
+                  : 0
+                const pts = ownPts + lockedPts
                 const isFrozen = freezeActive?.playerId === fp.id
                 const frRemaining = isFrozen ? Math.max(0, freezeActive.endsAtMinute - minute) : 0
                 return (
@@ -560,7 +651,12 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
                         <span className={`font-black ${pts >= 0 ? cls.text : 'text-red-400'}`}>{pts > 0 ? '+' : ''}{pts}</span>
                       </div>
                     </div>
-                    <span className="text-green-700 text-[10px]">{fp.position}</span>
+                    <div className="flex items-center gap-1 flex-wrap">
+                      <span className="text-green-700 text-[10px]">{fp.position}</span>
+                      {fp.subbedInAt && (
+                        <span className="text-orange-400/70 text-[10px]">⇄ in {fp.subbedInAt}'</span>
+                      )}
+                    </div>
                   </div>
                 )
               })}
@@ -618,6 +714,19 @@ export default function MultiplayerGameScreen({ roomInfo, room: initialRoom, pla
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+// Stable key for a raw API-Football event object.
+// One raw event can fan out into two mapped events (goal + assist) so dedup must
+// happen at the raw level, not the mapped level.
+function rawApiEventKey(event) {
+  return [
+    event.time.elapsed,
+    event.time.extra ?? 0,
+    event.player?.id ?? event.player?.name ?? '?',
+    event.type,
+    event.detail,
+  ].join(':')
+}
 
 async function insertSystemEvent(code, minute, message) {
   await supabase.from('ticker_events').insert({

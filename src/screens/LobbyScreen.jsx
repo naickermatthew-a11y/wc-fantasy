@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { PLAYER_COLORS, COLOR_CLASSES } from '../lib/roomUtils'
 import { MATCHES } from '../data/matches'
+import RoomCodePill from '../components/RoomCodePill'
 
 export default function LobbyScreen({ roomInfo, onStart, onBack }) {
   const { code, userId, isHost } = roomInfo
@@ -70,6 +71,7 @@ export default function LobbyScreen({ roomInfo, onStart, onBack }) {
 
   return (
     <div className="max-w-lg mx-auto px-4 py-8">
+      <RoomCodePill code={code} />
       <div className="text-center mb-8">
         <p className="text-green-600 text-xs font-semibold uppercase tracking-widest mb-2">Room Code</p>
         <p className="text-5xl font-black text-green-300 tracking-widest">{code}</p>

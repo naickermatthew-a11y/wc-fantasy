@@ -2,6 +2,20 @@ import { useState } from 'react'
 import { supabase } from '../lib/supabase'
 import { generateRoomCode, getUserId, getDisplayName, setDisplayName } from '../lib/roomUtils'
 
+function describeSupabaseError(err) {
+  const msg = err?.message || String(err)
+  if (/load failed|failed to fetch|networkerror|network request failed/i.test(msg)) {
+    return `Network error — could not reach Supabase. Check your internet connection or VITE_SUPABASE_URL. (${msg})`
+  }
+  if (/401|403|jwt|invalid key/i.test(msg)) {
+    return `Supabase authentication failed — check VITE_SUPABASE_ANON_KEY. (${msg})`
+  }
+  if (/404|not_found|hostname|err_name_not_resolved/i.test(msg)) {
+    return `Cannot resolve Supabase host — check VITE_SUPABASE_URL. (${msg})`
+  }
+  return msg
+}
+
 export default function MultiplayerSetupScreen({ match, onRoomCreated, onRoomJoined, onBack }) {
   const [mode, setMode] = useState(null) // 'create' | 'join'
   const [roomCode, setRoomCode] = useState('')
@@ -12,80 +26,101 @@ export default function MultiplayerSetupScreen({ match, onRoomCreated, onRoomJoi
 
   async function handleCreate() {
     if (!name.trim()) { setError('Enter your name'); return }
+    if (!supabase) { setError('Supabase is not configured — check VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in your .env file'); return }
     setLoading(true)
     setError('')
     setDisplayName(name.trim())
     const userId = getUserId()
     const code = generateRoomCode()
 
-    const { error: roomErr } = await supabase.from('rooms').insert({
-      code,
-      host_id: userId,
-      match_id: match.id,
-      status: 'waiting',
-      max_players: maxPlayers,
-      draft_pick_index: 0,
-      // Store match display data so non-host clients can show the correct header
-      game_state: {
-        matchData: { home: match.home, away: match.away, homeScore: 0, awayScore: 0 },
-      },
-    })
-    if (roomErr) { setError(roomErr.message); setLoading(false); return }
+    try {
+      const { error: roomErr } = await supabase.from('rooms').insert({
+        code,
+        host_id: userId,
+        match_id: match.id,
+        status: 'waiting',
+        max_players: maxPlayers,
+        draft_pick_index: 0,
+        // Store match display data so non-host clients can show the correct header
+        game_state: {
+          matchData: { home: match.home, away: match.away, homeScore: 0, awayScore: 0 },
+        },
+      })
+      if (roomErr) { setError(roomErr.message); setLoading(false); return }
 
-    const { error: playerErr } = await supabase.from('room_players').insert({
-      room_code: code,
-      user_id: userId,
-      display_name: name.trim(),
-      pick_order: 0,
-      picks: [],
-    })
-    if (playerErr) { setError(playerErr.message); setLoading(false); return }
+      const { error: playerErr } = await supabase.from('room_players').insert({
+        room_code: code,
+        user_id: userId,
+        display_name: name.trim(),
+        pick_order: 0,
+        picks: [],
+      })
+      if (playerErr) { setError(playerErr.message); setLoading(false); return }
+    } catch (err) {
+      setError(describeSupabaseError(err))
+      setLoading(false)
+      return
+    }
 
     setLoading(false)
-    onRoomCreated({ code, userId, isHost: true, matchId: match.id })
+    onRoomCreated({ code, userId, isHost: true, matchId: match.id, roomStatus: 'waiting' })
   }
 
   async function handleJoin() {
     if (!name.trim()) { setError('Enter your name'); return }
     if (roomCode.trim().length !== 6) { setError('Enter a 6-character room code'); return }
+    if (!supabase) { setError('Supabase is not configured — check VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in your .env file'); return }
     setLoading(true)
     setError('')
     setDisplayName(name.trim())
     const userId = getUserId()
     const code = roomCode.trim().toUpperCase()
 
-    const { data: room, error: roomErr } = await supabase
-      .from('rooms')
-      .select('*')
-      .eq('code', code)
-      .single()
+    try {
+      const { data: room, error: roomErr } = await supabase
+        .from('rooms')
+        .select('*')
+        .eq('code', code)
+        .single()
 
-    if (roomErr || !room) { setError('Room not found'); setLoading(false); return }
-    if (room.status !== 'waiting') { setError('This game has already started'); setLoading(false); return }
+      if (roomErr || !room) { setError('Room not found'); setLoading(false); return }
+      if (room.status === 'finished') { setError('This game has already ended'); setLoading(false); return }
 
-    const { data: existing } = await supabase
-      .from('room_players')
-      .select('user_id')
-      .eq('room_code', code)
+      // Late join: game already in progress — skip room_players insert here;
+      // LateJoinScreen upserts the row once they've chosen their picks.
+      if (room.status === 'drafting' || room.status === 'playing') {
+        setLoading(false)
+        onRoomJoined({ code, userId, isHost: false, matchId: room.match_id, roomStatus: room.status })
+        return
+      }
 
-    if (existing && existing.length >= room.max_players) {
-      setError('Room is full'); setLoading(false); return
+      const { data: existing } = await supabase
+        .from('room_players')
+        .select('user_id')
+        .eq('room_code', code)
+
+      if (existing && existing.length >= room.max_players) {
+        setError('Room is full'); setLoading(false); return
+      }
+
+      const pickOrder = existing ? existing.length : 0
+
+      const { error: playerErr } = await supabase.from('room_players').upsert({
+        room_code: code,
+        user_id: userId,
+        display_name: name.trim(),
+        pick_order: pickOrder,
+        picks: [],
+      }, { onConflict: 'room_code,user_id' })
+
+      if (playerErr) { setError(playerErr.message); setLoading(false); return }
+
+      setLoading(false)
+      onRoomJoined({ code, userId, isHost: room.host_id === userId, matchId: room.match_id, roomStatus: 'waiting' })
+    } catch (err) {
+      setError(describeSupabaseError(err))
+      setLoading(false)
     }
-
-    const pickOrder = existing ? existing.length : 0
-
-    const { error: playerErr } = await supabase.from('room_players').upsert({
-      room_code: code,
-      user_id: userId,
-      display_name: name.trim(),
-      pick_order: pickOrder,
-      picks: [],
-    }, { onConflict: 'room_code,user_id' })
-
-    if (playerErr) { setError(playerErr.message); setLoading(false); return }
-
-    setLoading(false)
-    onRoomJoined({ code, userId, isHost: room.host_id === userId, matchId: room.match_id })
   }
 
   return (

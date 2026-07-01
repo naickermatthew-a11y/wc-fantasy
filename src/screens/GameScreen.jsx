@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import { PLAYERS_BY_MATCH } from '../data/matches'
 import { SCORING, generateEvent } from '../data/events'
-import { fetchFixtureEvents, mapApiEventsToGame, fetchPlayerStats, mapPlayerStatsToEvents } from '../lib/apiFootball'
+import { fetchFixtureEvents, fetchFixtureStatus, mapApiEventsToGame, fetchPlayerStats, mapPlayerStatsToEvents } from '../lib/apiFootball'
 import CaptainBadge from '../components/CaptainBadge'
 
-const MATCH_DURATION = 90
+const MATCH_DURATION = 90     // nominal end; display switches to 90+X after this
+const MAX_SIM_DURATION = 97   // sim clock/ticker stop here (allows ~7 min stoppage)
 const EVENT_INTERVAL_MS = 25000
 const LIVE_POLL_MS = 60000
 
@@ -38,6 +39,8 @@ export default function GameScreen({ match, picks, allMatchPlayers, onEnd }) {
 
   const [effectivePicks, setEffectivePicks] = useState({ player: picks.player, cpu: picks.cpu })
   const [gameOver, setGameOver] = useState(false)
+  const gameOverRef = useRef(false)
+  gameOverRef.current = gameOver
 
   // Arcade animations
   const [goalFlash, setGoalFlash] = useState({})
@@ -67,8 +70,12 @@ export default function GameScreen({ match, picks, allMatchPlayers, onEnd }) {
   const effectivePicksRef = useRef(effectivePicks)
   effectivePicksRef.current = effectivePicks
   const lastProcessedApiMinuteRef = useRef(match.minute || 0)
+  const processedEventKeysRef = useRef(new Set())  // deduplicate re-polled events
   const lastPlayerStatsRef = useRef({})
   const statsInitializedRef = useRef(false)
+
+  // Substitution tracking: how many sims subs each side has done (max 1 each)
+  const subsDoneRef = useRef({ player: 0, cpu: 0 })
 
   // Expire doubleDown when its timer runs out
   useEffect(() => {
@@ -86,11 +93,41 @@ export default function GameScreen({ match, picks, allMatchPlayers, onEnd }) {
     }
   }, [minute, freezeActive])
 
+  // Simulate random substitutions in CPU mode (not live API mode) after minute 55
+  useEffect(() => {
+    if (isLiveApiMode || minute < 55) return
+
+    for (const team of ['player', 'cpu']) {
+      if (subsDoneRef.current[team] >= 1) continue
+      if (Math.random() > 0.025) continue  // ~2.5% per minute → ~1 sub per team
+
+      const picks = effectivePicksRef.current[team]
+      // Only sub out a starter — not someone who already came on, not red-carded
+      const candidate = picks.find(p => !p.redCarded && !p.subbedInAt)
+      if (!candidate) continue
+
+      const slotIdx = picks.indexOf(candidate)
+      const allDraftedIds = new Set([
+        ...effectivePicksRef.current.player,
+        ...effectivePicksRef.current.cpu,
+      ].map(p => p.id))
+
+      const replacement = allPlayers.find(p =>
+        p.team === candidate.team &&
+        !allDraftedIds.has(p.id)
+      )
+      if (!replacement) continue
+
+      subsDoneRef.current[team]++
+      triggerSubstitution(team, slotIdx, candidate, replacement, minute)
+    }
+  }, [minute, isLiveApiMode])
+
   // Clock: 1 sim-minute = EVENT_INTERVAL_MS / 25 real-ms (~1 s)
   useEffect(() => {
     const clockInterval = EVENT_INTERVAL_MS / 25
     clockRef.current = setInterval(() => {
-      setMinute(prev => prev >= MATCH_DURATION ? prev : prev + 1)
+      setMinute(prev => prev >= MAX_SIM_DURATION ? prev : prev + 1)
     }, clockInterval)
     return () => clearInterval(clockRef.current)
   }, [])
@@ -98,7 +135,7 @@ export default function GameScreen({ match, picks, allMatchPlayers, onEnd }) {
   // Event ticker every EVENT_INTERVAL_MS
   useEffect(() => {
     tickerRef.current = setInterval(() => {
-      if (minuteRef.current >= MATCH_DURATION) {
+      if (minuteRef.current >= MAX_SIM_DURATION) {
         clearInterval(tickerRef.current)
         return
       }
@@ -112,14 +149,45 @@ export default function GameScreen({ match, picks, allMatchPlayers, onEnd }) {
     if (!isLiveApiMode) return
 
     const poll = async () => {
+      if (gameOverRef.current) return
       try {
+        // Update real match minute and detect full time.
+        const status = await fetchFixtureStatus(match.id)
+        if (status) {
+          const realMinute = status.effectiveMinute  // elapsed + extra (e.g. 94 during 90+4)
+          if (realMinute > minuteRef.current) {
+            setMinute(realMinute)
+          }
+          if (status.status === 'FT' && !gameOverRef.current) {
+            setGameOver(true)
+            clearInterval(clockRef.current)
+            clearInterval(tickerRef.current)
+            return
+          }
+        }
+
         const allPicks = [...effectivePicksRef.current.player, ...effectivePicksRef.current.cpu]
 
-        // Goals and cards from the events endpoint
+        // Goals, cards, and substitutions from the events endpoint.
+        // Use strict < so events at the exact lastProcessedApiMinute boundary aren't
+        // dropped when the API delivers two events at the same minute across separate polls.
+        // processedEventKeysRef prevents the same event being awarded twice on reprocessing.
         const rawEvents = await fetchFixtureEvents(match.id)
-        const newEvents = mapApiEventsToGame(rawEvents, allPicks, lastProcessedApiMinuteRef.current)
-        for (const { player, eventType, minute: evMin } of newEvents) {
-          if (player) fireEvent(evMin, player, eventType)
+        const newEvents = mapApiEventsToGame(rawEvents, allPicks, lastProcessedApiMinuteRef.current, true)
+        for (const ev of newEvents) {
+          const key = `${ev.apiName ?? ev.player?.id}:${ev.eventType}:${ev.minute}`
+          if (processedEventKeysRef.current.has(key)) continue
+
+          if (ev.eventType === 'substitution') {
+            handleApiSubstitution(ev)
+            processedEventKeysRef.current.add(key)
+          } else if (ev.player) {
+            // Only lock the key when the event was actually matched and awarded.
+            // If ev.player is null (substitute not yet in picks), leave the key unregistered
+            // so the next poll can retry once the sub-in player is in effectivePicks.
+            fireEvent(ev.minute, ev.player, ev.eventType)
+            processedEventKeysRef.current.add(key)
+          }
         }
         if (newEvents.length > 0) {
           lastProcessedApiMinuteRef.current = Math.max(
@@ -154,14 +222,14 @@ export default function GameScreen({ match, picks, allMatchPlayers, onEnd }) {
     return () => clearInterval(interval)
   }, [isLiveApiMode, effectivePicks])
 
-  // End game
+  // End game — sim mode ends at MAX_SIM_DURATION; live API mode ends on API FT status
   useEffect(() => {
-    if (minute >= MATCH_DURATION && !gameOver) {
+    if (!isLiveApiMode && minute >= MAX_SIM_DURATION && !gameOver) {
       setGameOver(true)
       clearInterval(clockRef.current)
       clearInterval(tickerRef.current)
     }
-  }, [minute, gameOver])
+  }, [minute, gameOver, isLiveApiMode])
 
   useEffect(() => {
     if (gameOver) {
@@ -177,7 +245,10 @@ export default function GameScreen({ match, picks, allMatchPlayers, onEnd }) {
   }, [gameOver])
 
   function fireEvent(currentMinute, overridePlayer = null, overrideEventType = null) {
-    const allOnPitch = [...effectivePicks.player, ...effectivePicks.cpu]
+    // Always read from the ref so substitutions take effect immediately without
+    // waiting for React to re-render the effectivePicks closure.
+    const picks = effectivePicksRef.current
+    const allOnPitch = [...picks.player, ...picks.cpu]
 
     let player, eventType, points
     if (overridePlayer && overrideEventType) {
@@ -190,14 +261,14 @@ export default function GameScreen({ match, picks, allMatchPlayers, onEnd }) {
       ;({ player, eventType, points } = event)
     }
 
-    const owner = effectivePicks.player.find(p => p.id === player.id) ? 'player' : 'cpu'
+    const owner = picks.player.find(p => p.id === player.id) ? 'player' : 'cpu'
 
     const dd = doubleDownRef.current
     const fr = freezeRef.current
 
     const isFrozen = fr && fr.playerId === player.id && currentMinute < fr.endsAtMinute
     const isDoubled = dd && dd.playerId === player.id && dd.owner === owner && currentMinute < dd.endsAtMinute
-    const isCaptain = effectivePicks[owner][0]?.id === player.id
+    const isCaptain = picks[owner][0]?.id === player.id
 
     let effectivePoints = isFrozen ? 0 : points
     if (!isFrozen && isCaptain) effectivePoints = effectivePoints * 1.5
@@ -285,6 +356,60 @@ export default function GameScreen({ match, picks, allMatchPlayers, onEnd }) {
     }, ...prev].slice(0, 30))
   }
 
+  function triggerSubstitution(team, slotIdx, playerOff, playerOn, subMinute) {
+    const playerOnAugmented = {
+      ...playerOn,
+      subbedInAt: subMinute,
+      subbedInFor: playerOff.name,
+      replacedPlayerId: playerOff.id,
+    }
+
+    // Update the ref synchronously so fireEvent doesn't fire on the old player
+    // in the window between setEffectivePicks being called and React re-rendering.
+    const newPicks = {
+      ...effectivePicksRef.current,
+      [team]: effectivePicksRef.current[team].map((p, i) => i === slotIdx ? playerOnAugmented : p),
+    }
+    effectivePicksRef.current = newPicks
+    setEffectivePicks(newPicks)
+
+    setPlayerPoints(prev => prev[playerOn.id] ? prev : { ...prev, [playerOn.id]: [] })
+
+    setTicker(prev => [{
+      minute: subMinute,
+      substitution: true,
+      playerOff: playerOff.name,
+      playerOn: playerOn.name,
+      id: Date.now() + Math.random(),
+    }, ...prev].slice(0, 30))
+  }
+
+  function handleApiSubstitution({ player: playerOff, playerOnApiId, playerOnApiName, minute: subMinute }) {
+    if (!playerOff) return  // Only handle if a drafted player was subbed off
+
+    let team = null, slotIdx = -1
+    for (const t of ['player', 'cpu']) {
+      const idx = effectivePicksRef.current[t].findIndex(p => p.id === playerOff.id)
+      if (idx !== -1) { team = t; slotIdx = idx; break }
+    }
+    if (!team) return
+
+    const playerOnApiLast = playerOnApiName?.trim().split(/\s+/).pop().toLowerCase()
+    const playerOn = allPlayers.find(p =>
+      p.id === `api-${playerOnApiId}` ||
+      (playerOnApiLast && playerOnApiLast.length >= 3 &&
+        p.name.trim().split(/\s+/).pop().toLowerCase() === playerOnApiLast)
+    ) || {
+      id: `sub-${playerOnApiId || Date.now()}`,
+      name: playerOnApiName || 'Substitute',
+      team: playerOff.team,
+      position: playerOff.position,
+      number: null,
+    }
+
+    triggerSubstitution(team, slotIdx, playerOff, playerOn, subMinute)
+  }
+
   return (
     <div className="max-w-lg mx-auto px-4 py-6">
       {/* Match header */}
@@ -304,7 +429,9 @@ export default function GameScreen({ match, picks, allMatchPlayers, onEnd }) {
           ) : (
             <>
               <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse inline-block" />
-              <span className="font-orbitron text-green-400 font-bold text-sm">{minute}'</span>
+              <span className="font-orbitron text-green-400 font-bold text-sm">
+                {minute > MATCH_DURATION ? `90+${minute - MATCH_DURATION}` : minute}'
+              </span>
             </>
           )}
         </div>
@@ -465,7 +592,11 @@ function RosterColumn({ label, players, playerPoints, isPlayer, captainId, power
       </p>
       <div className="space-y-1.5">
         {players.map(player => {
-          const pts = (playerPoints[player.id] || []).reduce((s, e) => s + e.points, 0)
+          const ownPts = (playerPoints[player.id] || []).reduce((s, e) => s + e.points, 0)
+          const lockedPts = player.replacedPlayerId
+            ? (playerPoints[player.replacedPlayerId] || []).reduce((s, e) => s + e.points, 0)
+            : 0
+          const pts = ownPts + lockedPts
           const isDoubled = doubleDownActive?.playerId === player.id
           const isFrozen = freezeActive?.playerId === player.id
           const isCaptain = player.id === captainId
@@ -512,11 +643,34 @@ function RosterColumn({ label, players, playerPoints, isPlayer, captainId, power
                   </span>
                 )}
               </div>
-              {(playerPoints[player.id] || []).map((ev, i) => (
-                <div key={i} className={`text-[10px] mt-0.5 ${ev.points >= 0 ? 'text-green-600' : 'text-red-500'}`}>
-                  {ev.minute}' {SCORING[ev.eventType]?.label} {ev.points > 0 ? '+' : ''}{ev.points}
-                </div>
-              ))}
+              {player.subbedInAt ? (
+                <>
+                  {/* Locked section — original player's points before sub */}
+                  <div className="text-[10px] mt-1 text-orange-400/70 font-semibold">
+                    {player.subbedInFor}: {lockedPts > 0 ? '+' : ''}{lockedPts} (locked {player.subbedInAt}')
+                  </div>
+                  {(playerPoints[player.replacedPlayerId] || []).map((ev, i) => (
+                    <div key={`locked-${i}`} className={`text-[10px] mt-0.5 opacity-50 ${ev.points >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                      {ev.minute}' {SCORING[ev.eventType]?.label} {ev.points > 0 ? '+' : ''}{ev.points}
+                    </div>
+                  ))}
+                  {/* New player's points since sub */}
+                  <div className="text-[10px] mt-1 text-green-600 font-semibold">
+                    {player.name}: {ownPts > 0 ? '+' : ''}{ownPts} since {player.subbedInAt}'
+                  </div>
+                  {(playerPoints[player.id] || []).map((ev, i) => (
+                    <div key={i} className={`text-[10px] mt-0.5 ${ev.points >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                      {ev.minute}' {SCORING[ev.eventType]?.label} {ev.points > 0 ? '+' : ''}{ev.points}
+                    </div>
+                  ))}
+                </>
+              ) : (
+                (playerPoints[player.id] || []).map((ev, i) => (
+                  <div key={i} className={`text-[10px] mt-0.5 ${ev.points >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                    {ev.minute}' {SCORING[ev.eventType]?.label} {ev.points > 0 ? '+' : ''}{ev.points}
+                  </div>
+                ))
+              )}
             </div>
           )
         })}
@@ -566,6 +720,17 @@ function TickerRow({ entry }) {
     return (
       <div className="px-4 py-2 bg-green-950/20">
         <p className="text-xs text-green-300 font-medium">{entry.message}</p>
+      </div>
+    )
+  }
+  if (entry.substitution) {
+    return (
+      <div className="px-4 py-2 flex items-center gap-1">
+        <span className="text-green-700 text-xs font-medium flex-shrink-0">{entry.minute}'</span>
+        <span className="text-orange-300 text-xs font-semibold truncate">{entry.playerOff}</span>
+        <span className="text-green-600 text-xs flex-shrink-0">off →</span>
+        <span className="text-green-200 text-xs font-semibold truncate">{entry.playerOn}</span>
+        <span className="text-green-600 text-xs flex-shrink-0">in</span>
       </div>
     )
   }

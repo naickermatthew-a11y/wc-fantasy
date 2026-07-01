@@ -8,6 +8,7 @@ import LobbyScreen from './screens/LobbyScreen'
 import MultiplayerDraftScreen from './screens/MultiplayerDraftScreen'
 import MultiplayerGameScreen from './screens/MultiplayerGameScreen'
 import MultiplayerResultScreen from './screens/MultiplayerResultScreen'
+import LateJoinScreen from './screens/LateJoinScreen'
 
 export default function App() {
   const [screen, setScreen] = useState('home')
@@ -42,7 +43,17 @@ export default function App() {
 
   function onRoomJoined(roomInfo) {
     setGameState(prev => ({ ...prev, roomInfo }))
-    setScreen('mp-lobby')
+    // Route to late-join screen if the game is already in progress
+    if (roomInfo.roomStatus === 'waiting') {
+      setScreen('mp-lobby')
+    } else {
+      setScreen('mp-late-join')
+    }
+  }
+
+  function onLateJoin({ room, players, match }) {
+    setGameState(prev => ({ ...prev, room, players, match }))
+    setScreen('mp-game')
   }
 
   function onLobbyStart({ room, players }) {
@@ -124,6 +135,13 @@ export default function App() {
           players={gameState.players}
           match={gameState.match}
           onEnd={onMpGameEnd}
+        />
+      )}
+      {screen === 'mp-late-join' && (
+        <LateJoinScreen
+          roomInfo={gameState.roomInfo}
+          onJoin={onLateJoin}
+          onBack={goHome}
         />
       )}
       {screen === 'mp-result' && (

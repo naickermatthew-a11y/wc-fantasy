@@ -90,6 +90,11 @@ function teamFlag(name) {
   return COUNTRY_ISO2[name] || null
 }
 
+// API-Football sometimes returns names prefixed with a 2-letter ISO code, e.g. "fr France"
+function stripCountryCodePrefix(name) {
+  return name.replace(/^[a-z]{2}\s+/, '')
+}
+
 // ── AEST time helpers (UTC+10, Queensland — no DST ever) ─────────────────────
 
 const AEST_OFFSET_MS = 10 * 60 * 60 * 1000
@@ -118,17 +123,19 @@ function formatKickoff(isoDate) {
 export function mapFixture(f) {
   const status = mapStatus(f.fixture.status.short)
   const venueParts = [f.fixture.venue?.name, f.fixture.venue?.city].filter(Boolean)
+  const homeName = stripCountryCodePrefix(f.teams.home.name)
+  const awayName = stripCountryCodePrefix(f.teams.away.name)
   return {
     id: f.fixture.id,
     home: {
-      name: f.teams.home.name,
-      flag: teamFlag(f.teams.home.name),
-      code: f.teams.home.code || f.teams.home.name.slice(0, 3).toUpperCase(),
+      name: homeName,
+      flag: teamFlag(homeName),
+      code: f.teams.home.code || homeName.slice(0, 3).toUpperCase(),
     },
     away: {
-      name: f.teams.away.name,
-      flag: teamFlag(f.teams.away.name),
-      code: f.teams.away.code || f.teams.away.name.slice(0, 3).toUpperCase(),
+      name: awayName,
+      flag: teamFlag(awayName),
+      code: f.teams.away.code || awayName.slice(0, 3).toUpperCase(),
     },
     status,
     minute: f.fixture.status.elapsed || 0,
@@ -214,7 +221,7 @@ export async function fetchLineup(fixtureId) {
       const player = {
         id: `api-${entry.player.id}`,
         name: entry.player.name,
-        team: team.team.name,
+        team: stripCountryCodePrefix(team.team.name),
         position: mapPosition(entry.player.pos),
         number: entry.player.number,
       }
@@ -234,8 +241,14 @@ export async function fetchFixtureStatus(fixtureId) {
   const data = await apiFetch(`/fixtures?id=${fixtureId}`)
   if (!data || data.length === 0) return null
   const f = data[0]
+  const elapsed = f.fixture.status.elapsed ?? 0
+  const extra   = f.fixture.status.extra  ?? 0
   return {
-    elapsed: f.fixture.status.elapsed ?? 0,
+    elapsed,
+    extra,
+    // Combined minute used for timers, event ordering, and power-up expiry.
+    // During stoppage time: elapsed=90, extra=4 → effectiveMinute=94.
+    effectiveMinute: elapsed + extra,
     status: mapStatus(f.fixture.status.short),
     homeScore: f.goals.home ?? 0,
     awayScore: f.goals.away ?? 0,
@@ -328,8 +341,10 @@ export function mapPlayerStatsToEvents(currentStats, prevStats, draftedPlayers) 
 // `apiName` / `apiTeam` are the raw strings from the API for display.
 // Callers should insert a ticker row for every event and only award points when player != null.
 
-export function mapApiEventsToGame(rawEvents, draftedPlayers, afterMinute = 0) {
-  console.log(`[mapApiEventsToGame] rawEvents=${rawEvents?.length ?? 0} drafted=${draftedPlayers?.length ?? 0} afterMinute=${afterMinute}`)
+// strictBoundary=true uses strict < so events at the exact afterMinute boundary
+// are not dropped when the API delivers two events at the same minute across polls.
+export function mapApiEventsToGame(rawEvents, draftedPlayers, afterMinute = 0, strictBoundary = false) {
+  console.log(`[mapApiEventsToGame] rawEvents=${rawEvents?.length ?? 0} drafted=${draftedPlayers?.length ?? 0} afterMinute=${afterMinute} strictBoundary=${strictBoundary}`)
 
   // Match by API numeric id (prefix 'api-') first, then by last-name as fallback.
   // Hardcoded squad players use ids like 'est-USA-10' so ID match fails for them.
@@ -350,7 +365,7 @@ export function mapApiEventsToGame(rawEvents, draftedPlayers, afterMinute = 0) {
 
   for (const event of rawEvents) {
     const elapsed = event.time.elapsed + (event.time.extra || 0)
-    if (elapsed <= afterMinute) continue
+    if (strictBoundary ? elapsed < afterMinute : elapsed <= afterMinute) continue
 
     console.log(`[mapApiEventsToGame] +${elapsed}' ${event.type} ${event.detail} | ${event.player?.name} (id:${event.player?.id}) | team: ${event.team?.name}`)
 
@@ -389,6 +404,20 @@ export function mapApiEventsToGame(rawEvents, draftedPlayers, afterMinute = 0) {
           minute: elapsed,
         })
       }
+    } else if (event.type === 'subst' || event.type === 'Subst') {
+      // API-Football: player = subbed OFF, assist = coming ON
+      const playerOff = findDrafted(event.player?.id, event.player?.name)
+      console.log(`  → sub off match: ${playerOff ? playerOff.name + ' (' + playerOff.id + ')' : 'NONE'} | sub on: ${event.assist?.name} (id:${event.assist?.id})`)
+      result.push({
+        apiName: event.player?.name ?? '?',
+        apiNameOn: event.assist?.name ?? '?',
+        apiTeam: event.team?.name ?? '',
+        player: playerOff,
+        playerOnApiId: event.assist?.id ?? null,
+        playerOnApiName: event.assist?.name ?? null,
+        eventType: 'substitution',
+        minute: elapsed,
+      })
     }
   }
 

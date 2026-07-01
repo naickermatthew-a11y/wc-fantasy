@@ -7,6 +7,7 @@ import { SectionedPlayerList, LineupStatusBadge } from '../components/PlayerSect
 import CountdownRing from '../components/CountdownRing'
 import CaptainBadge from '../components/CaptainBadge'
 import FlagImg from '../components/FlagImg'
+import RoomCodePill from '../components/RoomCodePill'
 
 const PICK_SECONDS = 30
 
@@ -142,6 +143,7 @@ export default function MultiplayerDraftScreen({ roomInfo, room: initialRoom, pl
 
   return (
     <div className="max-w-lg mx-auto px-4 py-6">
+      <RoomCodePill code={code} />
       <div className="text-center mb-5">
         <h2 className="font-orbitron text-2xl font-black text-green-400">Draft</h2>
         {match && (
